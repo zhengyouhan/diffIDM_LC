@@ -28,7 +28,7 @@ Standard automatic differentiation (e.g., JAX, PyTorch) computes gradients assum
 2. **The timing sensitivity** — how $\theta$ affects *when* the switch occurs
 3. **The decision sensitivity** — how $\theta$ affects *whether* the switch occurs
 
-Ignoring these produces **biased gradients** that can mislead optimization.
+Ignoring these produces **zero or biased gradients** that can mislead optimization.
 
 ## The System as a Hybrid Dynamical System
 
@@ -45,25 +45,34 @@ This is structurally identical to **contact events in rigid-body simulation**:
 | Lane change (leader switch) | Contact on/off |
 | Minimum spacing $s \geq s_0$ | Non-penetration $\phi \geq 0$ |
 | MOBIL incentive $h > 0$ → switch | Contact force $\lambda > 0$ → push |
-| Complementarity: $\mu \perp g \geq 0$ | Same NCP structure |
 | Saltation matrix $\Xi$ | Saltation matrix $\Xi$ |
 
 The robotics community has developed scalable methods for differentiating through contact (Dojo, Drake). **Nobody has applied this to traffic.**
 
 ## The Inverse Problem
 
-Given observed trajectories $\mathbf{z}^{\text{obs}}$, recover the IDM parameters $\theta = (v_0, T, a, b)$ by minimizing:
+We consider two inverse problems:
 
-$$J(\theta) = \frac{1}{NK}\sum_{i,k}\left(x_i^{\text{sim}}(k;\theta) - x_i^{\text{obs}}(k)\right)^2$$
+### 1. IDM Parameter Estimation (macro → micro)
+Given macroscopic observations (density, flow from loop detectors), recover IDM parameters $\theta = (v_0, T, a, b)$ by minimizing:
 
-This requires $dJ/d\theta$, which must correctly propagate through all lane-change events in the simulation.
+$$J(\theta) = \| \rho^{\text{sim}}(\theta) - \rho^{\text{obs}} \|^2 + \| q^{\text{sim}}(\theta) - q^{\text{obs}} \|^2$$
+
+where macroscopic fields are obtained from microscopic trajectories via Gaussian kernel smoothing.
+
+### 2. MOBIL Parameter Reconstruction (micro → micro)
+Given observed vehicle trajectories with known (heterogeneous) IDM parameters, recover MOBIL parameters $\theta_{\text{LC}} = (p, \Delta a_{\text{th}})$ by minimizing:
+
+$$J(\theta_{\text{LC}}) = \frac{1}{NK}\sum_{i,k}\left(x_i^{\text{sim}}(k;\theta_{\text{LC}}) - x_i^{\text{obs}}(k)\right)^2$$
+
+Both require $dJ/d\theta$, which must correctly propagate through all lane-change events.
 
 ## What We Need
 
-A backward pass that composes three gradient components:
+A backward pass that handles the discontinuities introduced by lane-change events. Our approach combines:
 
 1. **Adjoint through IDM dynamics** (smooth arcs between lane changes)
-2. **Saltation matrix correction** at each topology switch (continuous dynamics jump)
-3. **Straight-Through Gumbel gradient** through the discrete lane-change decision
+2. **Sigmoid relaxation of the MOBIL decision** — replacing the hard threshold with $\sigma(h/\tau)$ to enable gradient flow
+3. **Saltation matrix correction** at each topology switch (dynamics jump)
 
-→ See [methodology.md](methodology.md) for our solution.
+→ See [methodology.md](methodology.md) for the full approach.

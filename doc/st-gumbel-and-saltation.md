@@ -1,10 +1,10 @@
-# ST-Gumbel and Saltation Matrices
+# Gradient Techniques for Lane-Change Discontinuities
 
-Two complementary techniques for differentiating through lane-change events. Each handles a different aspect of the discontinuity.
+Three techniques for differentiating through lane-change events. Each handles a different aspect of the discontinuity.
 
 ---
 
-## 1. Straight-Through Gumbel Estimator (ST-Gumbel)
+## 1. Sigmoid Relaxation (Logit-MOBIL)
 
 ### What It Handles
 The **discrete decision**: should vehicle $i$ change lanes or not?
@@ -15,38 +15,27 @@ $$a_i = \mathbb{1}[h_i(\mathbf{z};\theta) > 0]$$
 
 The indicator function $\mathbb{1}[\cdot]$ has zero gradient almost everywhere — backpropagation through it gives $\partial a_i / \partial \theta = 0$, losing all information about how parameters affect the decision.
 
-### The Solution
-Decouple the forward and backward passes:
+### The Solution: Sigmoid Relaxation
+Replace the hard threshold with a sigmoid:
 
-**Forward (hard):** Use the exact discrete decision. The simulation sees the real, physical lane change.
-
-$$\text{logits} = (0, \; h_i/\tau), \qquad a_i = \arg\max_j(\text{logit}_j + g_j), \quad g_j \sim \text{Gumbel}(0,1)$$
-
-**Backward (soft):** Replace argmax with softmax for gradient computation:
-
-$$y_i^{\text{soft}} = \text{softmax}\left(\frac{\text{logits} + \mathbf{g}}{\tau}\right)$$
+$$P(\text{LC}_i) = \sigma(h_i / \tau) = \frac{1}{1 + e^{-h_i/\tau}}$$
 
 The gradient through the decision becomes:
 
-$$\frac{\partial a_i}{\partial h_i} \approx \frac{1}{\tau}\, y_{i,1}^{\text{soft}}\,(1 - y_{i,1}^{\text{soft}})$$
-
-This is the classic straight-through trick (Bengio et al. 2013, Jang et al. 2017).
-
-### Chain to Parameters
-Since $h_i$ depends on IDM accelerations which depend on $\theta$:
-
-$$\frac{\partial a_i}{\partial \theta} = \underbrace{\frac{\partial a_i}{\partial h_i}}_{\text{ST gradient}} \cdot \underbrace{\frac{\partial h_i}{\partial \theta}}_{\text{MOBIL → IDM}}$$
+$$\frac{\partial P}{\partial h_i} = \frac{1}{\tau}\, \sigma(h_i/\tau)\,(1 - \sigma(h_i/\tau))$$
 
 ### Temperature $\tau$
-- $\tau \to 0$: gradient concentrates near $h_i = 0$ (sharp decision boundary, high gradient magnitude)
-- $\tau \to \infty$: gradient spreads uniformly (noisy, uninformative)
-- We use $\tau = 0.1$ (near-deterministic with slight exploration)
+- $\tau \to 0$: sigmoid approaches hard step function (physical, but gradient concentrates near $h_i = 0$)
+- $\tau \to \infty$: sigmoid flattens (smooth everywhere, but unphysical lane changes)
+- **$\tau = 0.1$ is optimal**: nearly binary decisions with smooth gradient
 
-### What ST-Gumbel Captures
-How a small change in $\theta$ shifts the **probability** of a lane change occurring.
+### Why Not Gumbel-Softmax?
+We initially tried the straight-through Gumbel estimator (Jang et al. 2017). It failed because MOBIL decisions are typically **decisive** — the incentive $h$ is far from zero, causing gradient saturation. Gumbel-Softmax works best when decisions are genuinely uncertain (probabilities near 0.5), which only occurs in multi-lane scenarios with 3+ options.
 
-### What It Does NOT Capture
-What happens to the trajectory **after** the decision — the topology change and its dynamical consequences. That requires the saltation matrix.
+**Empirical evidence:** In ablation, configs without sigmoid relaxation (C, D) produce **exactly zero gradient** for MOBIL parameters. The sigmoid is the essential ingredient.
+
+### When Gumbel Does Work
+For 3+ lane scenarios, the decision becomes a multi-way choice (left/stay/right) via Gumbel-Softmax over logits $(h_{\text{left}}, 0, h_{\text{right}})$. With 3 options, at least one pair of probabilities is genuinely uncertain, and Gumbel gradients survive. This is tested on the `feature/multi-lane-gumbel` branch.
 
 ---
 
@@ -77,40 +66,34 @@ where:
 | $F^- = F_G(\mathbf{z}^*)$ | Pre-switch dynamics |
 | $D_\mathbf{z} h \cdot F^-$ | "Crossing speed" — how fast the incentive crosses zero |
 
-### Structure
-$\Xi$ is a **rank-1 perturbation of identity**: $\Xi = I + \mathbf{u}\,\mathbf{w}^\top$
-
-where:
-- $\mathbf{u} = \Delta F / (D_\mathbf{z} h \cdot F^-)$ — sparse, at most 3 nonzero entries (lane-changer + affected followers)
-- $\mathbf{w} = D_\mathbf{z} h$ — sparse, ~7 nonzero entries (vehicles involved in MOBIL evaluation)
-
 ### Adjoint Update
 In the backward pass, when we reach a lane-change event:
 
 $$\lambda \gets \Xi^\top \lambda = \lambda + \mathbf{w}\,(\mathbf{u}^\top \lambda)$$
 
-This is $O(N)$, not $O(N^2)$. We never form $\Xi$ as a full matrix.
+This is $O(N)$ — we never form $\Xi$ as a full matrix.
 
-### Sparsity in Traffic
-For a lane change by vehicle $c$:
-
-**$\Delta F$ is nonzero only for:**
-- Vehicle $c$ (gets a new leader → different gap → different acceleration)
-- Old follower of $c$ (loses $c$ as leader, inherits $c$'s old leader)
-- New follower of $c$ (gets $c$ as new leader)
-
-All position components are zero ($\dot{x} = v$ doesn't depend on topology).
+### Empirical Findings
+- Saltation **matters** for IDM parameter estimation in dense traffic (reduces error from 33.7% → 30.7%)
+- Saltation has **negligible effect** on MOBIL parameter reconstruction with sparse LC events (configs A ≈ B)
+- Hypothesis: saltation becomes more important as the number of LC events increases. Congested-flow ablation pending.
 
 ### The Grazing Problem
-When $D_\mathbf{z} h \cdot F^- \approx 0$ (the trajectory barely crosses the switching surface), $\|\Xi\|$ explodes. This is a **near-tangential lane change** — the vehicle is indifferent and a tiny perturbation determines the outcome.
-
-**Our fix:** Clamp $|D_\mathbf{z} h \cdot F^-| \geq \epsilon_{\text{salt}}$ with $\epsilon_{\text{salt}} = 0.01$. This bounds the saltation correction at the cost of slight gradient bias for grazing events.
+When $D_\mathbf{z} h \cdot F^- \approx 0$, $\|\Xi\|$ explodes. **Fix:** Clamp $|D_\mathbf{z} h \cdot F^-| \geq 0.01$.
 
 ---
 
-## 3. How They Compose: The Full Backward Pass
+## 3. Adjoint Through IDM Dynamics
 
-The two techniques are not alternatives — they handle **orthogonal aspects** of the lane-change discontinuity and compose in the backward sweep:
+Standard reverse-mode AD through the smooth car-following arcs between lane-change events:
+
+$$(\lambda_\mathbf{z}, \lambda_\theta) = \text{vjp}(\Phi_G, \mathbf{z}^k, \theta)^\top(\lambda)$$
+
+This is handled natively by JAX's autodiff. No special treatment needed — IDM is smooth and differentiable.
+
+---
+
+## 4. How They Compose: The Full Backward Pass
 
 ```
 λ = ∂J/∂z^{K}          # terminal adjoint
@@ -123,8 +106,8 @@ for k = K-1, ..., 0:
 
     # At lane-change events:
     if k is event j:
-        # (B) ST-Gumbel: decision gradient
-        γ_j = st_grad_j · (λᵀ · ΔF_j · Δt)
+        # (B) Sigmoid gradient: decision sensitivity
+        γ_j = σ'(h_j/τ) · (λᵀ · ΔF_j · Δt)
         grad_θ += γ_j · ∂h_j/∂θ
 
         # (C) Saltation: topology correction
@@ -133,20 +116,23 @@ for k = K-1, ..., 0:
 
 ### What Each Component Contributes
 
-| Component | Question it answers | Symbol |
-|-----------|-------------------|--------|
-| **(A) Adjoint** | How does $\theta$ affect the trajectory through smooth IDM dynamics? | $A_k, B_k$ |
-| **(B) ST-Gumbel** | How does $\theta$ affect *whether* a lane change occurs? | $\gamma_j \cdot \partial h_j / \partial\theta$ |
-| **(C) Saltation** | How does the topology switch affect trajectory sensitivity? | $\Xi_j$ |
+| Component | Question it answers |
+|-----------|-------------------|
+| **(A) Adjoint** | How does $\theta$ affect the trajectory through smooth IDM dynamics? |
+| **(B) Sigmoid** | How does $\theta$ affect *whether* a lane change occurs? |
+| **(C) Saltation** | How does the topology switch affect trajectory sensitivity? |
 
-### The Cross-Domain Insight
-This decomposition is structurally identical to differentiating through **contact events in rigid-body simulation** (Dojo, Drake):
+---
 
-- Saltation matrix = contact Jacobian correction
-- ST-Gumbel = smooth contact/separation decision
-- Grazing guard = regularized contact models
+## 5. Evolution of Approach
 
-The traffic and robotics communities face the same mathematical challenge. Our contribution is bringing the hybrid systems machinery to microscopic traffic simulation.
+| Phase | Approach | Result |
+|-------|----------|--------|
+| Phase 1 | ST-Gumbel + saltation | Gumbel gradients saturate on decisive MOBIL decisions |
+| Phase 2 | **Sigmoid relaxation + saltation** | **11.1% error** (τ=0.1), gradient flows through LC decisions |
+| Future | Multi-lane Gumbel-Softmax | 3-way softmax works when decisions are genuinely uncertain |
+
+The key lesson: the gradient technique must match the decision structure. Binary MOBIL → sigmoid. Multi-choice (3+ lanes) → Gumbel-Softmax.
 
 ---
 
