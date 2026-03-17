@@ -1,176 +1,283 @@
-# Methodology
+# Methodology — Continuous Lateral Dynamics
 
 ## Overview
 
-We implement a **fully differentiable microscopic multi-lane traffic simulation** that combines differentiable IDM car-following, sigmoid-relaxed MOBIL lane-changing, and saltation matrix corrections at topology switches. The pipeline enables gradient-based parameter estimation via backpropagation through the full simulation trajectory, including lane-change events.
+We implement a **fully differentiable microscopic multi-lane traffic simulation** where lane changes are continuous physical movements, not discrete events. The model is a single smooth ODE system $(\dot{x}, \dot{v}, \dot{y})$ that can be differentiated end-to-end via standard reverse-mode AD.
 
-→ See [st-gumbel-and-saltation.md](st-gumbel-and-saltation.md) for detailed exposition of each gradient component.
+No saltation matrices. No Gumbel-Softmax. No event detection. No graph rewiring.
+
+→ See [gradient-techniques.md](gradient-techniques.md) for detailed comparison with prior discrete-event approaches.
 
 ---
 
-## 1. Forward Model
+## 1. Vehicle State
 
-### 1.1 State Representation
+$N$ vehicles on a $K$-lane road. Each vehicle has continuous state:
 
-$N$ vehicles on a multi-lane road. Continuous state:
+$$\mathbf{z}_i = (x_i, v_i, y_i)$$
 
-$$\mathbf{z} = (x_1, v_1, x_2, v_2, \ldots, x_N, v_N) \in \mathbb{R}^{2N}$$
+- $x_i$: longitudinal position [m]
+- $v_i$: longitudinal velocity [m/s]
+- $y_i$: lateral position [m]
 
-Discrete state: lane assignments $\boldsymbol\ell = (\ell_1, \ldots, \ell_N) \in \{0,1,\ldots,L-1\}^N$.
+Lane centers at $y_k$ for $k = 1, \ldots, K$ (e.g., $y_1 = 0$, $y_2 = 3.7$, $y_3 = 7.4$ m for 3 lanes with width $W = 3.7$ m).
 
-### 1.2 IDM Car-Following
+Full state vector: $\mathbf{z} = (x_1, v_1, y_1, \ldots, x_N, v_N, y_N) \in \mathbb{R}^{3N}$.
 
-Under interaction graph $G(\boldsymbol\ell)$, each vehicle follows the IDM:
+---
 
-$$\dot{v}_i = a\left[1 - \left(\frac{v_i}{v_0}\right)^4 - \left(\frac{s^*(v_i, \Delta v_i)}{s_i}\right)^2\right]$$
+## 2. Lane Weights from Physical Position
 
-$$s^*(v, \Delta v) = \text{softplus}\left(s_0 + vT + \frac{v\,\Delta v}{2\sqrt{ab}}\right)$$
+Vehicle $i$'s membership in each lane is determined by its physical lateral position:
+
+$$w_i^{(k)} = \frac{\exp\left(-\gamma(y_i - y_k)^2\right)}{\sum_{k'} \exp\left(-\gamma(y_i - y_{k'})^2\right)}$$
+
+where $\gamma > 0$ controls the sharpness of lane boundaries.
+
+**Properties:**
+- Vehicle at lane center: $w \approx (0, 1, 0)$ (in lane 2)
+- Vehicle mid-transition: $w \approx (0.3, 0.5, 0.2)$
+- Smooth and $C^\infty$ in $y_i$
+- Weights come from physical position (a state variable with inertia), not from a relaxation or optimization decision — the car is literally at that position
+
+---
+
+## 3. Soft-Min Headway
+
+For vehicle $i$ in lane $k$, the effective headway to the nearest leader:
+
+$$\bar{s}_i^{(k)} = -\frac{1}{\mu} \ln \sum_{j:\, x_j > x_i} w_j^{(k)} \cdot e^{-\mu(x_j - x_i - L)}$$
+
+where:
+- $\mu > 0$: soft-min sharpness (receptive field $\sim 1/\mu$ meters)
+- $w_j^{(k)}$: vehicle $j$'s presence in lane $k$ (from its lateral position)
+- $L$: vehicle length
+
+**Interpretation:** "What is the effective gap to the nearest vehicle ahead of me in lane $k$, where both 'nearest' and 'in lane $k$' are soft?"
+
+Similarly, the soft velocity difference:
+
+$$\Delta \bar{v}_i^{(k)} = v_i - \frac{\sum_{j:\, x_j > x_i} w_j^{(k)} \cdot e^{-\mu(x_j - x_i - L)} \cdot v_j}{\sum_{j:\, x_j > x_i} w_j^{(k)} \cdot e^{-\mu(x_j - x_i - L)} + \epsilon}$$
+
+**Empty lane guard:** When no vehicle is ahead (sum → 0), $\bar{s} \to +\infty$ → free-flow acceleration.
+
+**Gradient properties:**
+- $\partial \bar{s}_i^{(k)} / \partial w_j^{(k)}$ decays as $e^{-\mu(x_j - x_i)}$ — automatic attention mechanism
+- Nearby vehicles dominate; distant vehicles contribute exponentially small gradients
+
+---
+
+## 4. IDM with Blended Headway
+
+Vehicle $i$'s acceleration is IDM, blended across lanes by its own lane weights:
+
+$$a_i = \sum_k w_i^{(k)} \cdot a_i^{\text{IDM}}\left(v_i, \bar{s}_i^{(k)}, \Delta\bar{v}_i^{(k)};\, \theta\right)$$
+
+where:
+
+$$a_i^{\text{IDM}}(v, s, \Delta v;\, \theta) = a\left[1 - \left(\frac{v}{v_0}\right)^\delta - \left(\frac{s^*(v, \Delta v)}{s}\right)^2\right]$$
+
+$$s^*(v, \Delta v) = \text{softplus}(s_0 + vT + v\Delta v / 2\sqrt{ab})$$
 
 Parameters: $\theta_{\text{CF}} = (v_0, T, a, b)$. Fixed: $s_0 = 2.0$, $\delta = 4$.
 
-Euler integration: $\mathbf{z}^{k+1} = \mathbf{z}^k + \Delta t \, F_G(\mathbf{z}^k; \theta)$ with $\Delta t = 0.1$s.
+**Interpretation:** A vehicle centered in lane 2 follows only lane 2's leader. A vehicle mid-transition follows a blend of adjacent lane leaders.
 
-### 1.3 MOBIL Lane-Changing with Sigmoid Relaxation
+### Committed Perception (Bernie's Fix)
 
-Every $\Delta t_{\text{LC}} = 1.0$s, each vehicle evaluates the MOBIL incentive $h_i(\mathbf{z};\theta)$.
+A subtlety: with pure Gaussian blending, a vehicle at mid-lane sees diluted leaders from both lanes → inflated headways → mid-lane equilibrium (free acceleration better than either lane).
 
-**Hard MOBIL:** $a_i = \mathbb{1}[h_i > 0]$ — not differentiable.
+**Fix:** Decouple ego perception from others' perception:
+- **Ego headway:** Based on target lane (committed decision, near-binary softmax with $\tau_{\text{decide}} = 0.05$)
+- **Others' headway:** Based on physical $y$ position (Gaussian blocking — the vehicle physically occupies space in both lanes)
 
-**Logit-MOBIL:** $P(\text{LC}_i) = \sigma(h_i / \tau)$ — differentiable, with temperature $\tau$ controlling sharpness.
-
-The incentive function:
-$$h_i = (\tilde{a}_i - a_i) + p(\Delta a_{\text{neighbors}}) - \Delta a_{\text{th}}$$
-
-Parameters: $\theta_{\text{LC}} = (p, \Delta a_{\text{th}})$.
-
-Safety constraint: $a_{\text{new follower}} \geq -b_{\text{safe}}$. Cooldown of 3.0s prevents rapid re-switching.
-
-### 1.4 Multi-Lane Extension (3+ lanes)
-
-For 3+ lanes, the binary decision becomes a multi-way choice. We use Gumbel-Softmax over logits:
-
-$$\mathbf{p} = \text{softmax}\left(\frac{(h_{\text{left}},\; 0,\; h_{\text{right}}) + \mathbf{g}}{\tau}\right), \quad \mathbf{g} \sim \text{Gumbel}(0,1)$$
-
-This works because with 3 options, at least one pair of probabilities is genuinely uncertain, preventing gradient saturation.
+This eliminates the mid-lane equilibrium while preserving physical blocking behavior for surrounding vehicles.
 
 ---
 
-## 2. Backward Pass
+## 5. 3-Way MOBIL Softmax Decision
 
-### 2.1 Cost Functions
+The lane-change decision is a softmax over MOBIL incentives for all $K$ lanes.
 
-**IDM estimation (macro loss):** Simulated trajectories → Gaussian kernel smoothing → macroscopic fields (ρ, q) → MSE vs. sensor data.
+### Per-Lane Incentive
 
-**MOBIL reconstruction (micro loss):** Direct trajectory MSE:
-$$J(\theta) = \frac{1}{NK}\sum_{i,k}\left(x_i^{\text{sim}} - x_i^{\text{obs}}\right)^2$$
+$$I_i^{(k)} = a_i^{(k)} - \bar{a}_i + \text{politeness}_i^{(k)}$$
 
-### 2.2 Composed Backward Sweep
+where:
+- $a_i^{(k)}$ = IDM acceleration in lane $k$
+- $\bar{a}_i$ = current blended acceleration
+- $\text{politeness}_i^{(k)}$ = continuous politeness term (§6)
 
-Three components compose in the backward sweep (see [st-gumbel-and-saltation.md](st-gumbel-and-saltation.md)):
+### Adjusted Incentives
 
-1. **Adjoint through Euler steps** — JAX reverse-mode AD
-2. **Sigmoid decision gradient** — $\sigma'(h/\tau) \cdot \lambda^\top \Delta F \cdot \Delta t$
-3. **Saltation correction** — $\lambda \gets \Xi^\top \lambda$ at each LC event
+The "stay" option (current lane) is the baseline:
 
-### 2.3 Post-Processing
+$$\tilde{I}_i^{(k)} = \begin{cases} 0 & \text{if } k = k_i^{\text{current}} \\ I_i^{(k)} - \Delta a_{\text{th}} & \text{otherwise} \end{cases}$$
 
-- **NaN safety:** `nan_to_num(grad, nan=0, posinf=1e3, neginf=-1e3)`
-- **Gradient clipping:** Global norm clipped to 10.0
+where $k_i^{\text{current}} = \arg\min_k |y_i - y_k|$.
 
----
+### Softmax Target
 
-## 3. Optimization
+$$\text{prob}_i^{(k)} = \frac{\exp(\tilde{I}_i^{(k)} / \tau)}{\sum_{k'} \exp(\tilde{I}_i^{(k')} / \tau)}$$
 
-- **Optimizer:** Adam (lr=0.02)
-- **Parameter clipping:** $v_0 \in [15, 50]$, $T \in [0.5, 3.0]$, $a \in [0.5, 3.0]$, $b \in [0.5, 5.0]$
-- **Iterations:** 120 per run
+$$y_i^{\text{target}} = \sum_k \text{prob}_i^{(k)} \cdot y_k$$
 
----
+The temperature $\tau$ controls **decision sharpness only**, not physical lateral speed. These are decoupled:
 
-## 4. Experiments and Results
-
-### 4.1 Temperature Sweep (IDM estimation)
-
-20 vehicles, 2 lanes, 120 iterations, macroscopic loss:
-
-| τ | Mean Error | v₀ | T | a | b | Lane Changes |
-|---|-----------|-----|------|------|------|------|
-| **0.1** | **11.1%** | 5.5% | 30.6% | 1.5% | 6.9% | 10 |
-| 0.5 | 18.0% | 5.6% | 31.2% | 27.2% | 8.0% | 45 |
-| 1.0 | 21.6% | 5.8% | 33.0% | 24.5% | 23.1% | 54 |
-| 2.0 | 14.9% | 6.5% | 28.8% | 9.4% | 14.8% | 96 |
-
-Baseline (hard MOBIL + saltation): **30.6%** → sigmoid relaxation: **11.1%**.
-
-Trade-off: larger τ produces more spurious lane changes, distorting the physics. At τ=0.1, lane changes remain nearly binary.
-
-### 4.2 MOBIL Reconstruction Ablation
-
-Recovering MOBIL params (p, Δa_th) from observed trajectories, known heterogeneous IDM:
-
-| Config | Description | p err | Δa_th err | Mean | Gradient? |
-|--------|-------------|-------|-----------|------|-----------|
-| A | Full (logit + salt + sig) | 8.6% | 21.6% | 15.1% | ✅ |
-| B | No saltation | 5.4% | 22.5% | 13.9% | ✅ |
-| C | No sigmoid grad | 60.0% | 100.0% | 80.0% | ❌ zero |
-| D | Hard MOBIL | 60.0% | 100.0% | 80.0% | ❌ zero |
-| E | Opposite init | 11.3% | 7.5% | **9.4%** | ✅ |
-
-**Key findings:**
-- **Configs C, D:** Zero gradient for MOBIL parameters — proves sigmoid relaxation is essential
-- **A ≈ B:** Saltation negligible in sparse-LC regime (1-2 events). Expected to matter more in congested scenarios with abundant lane changes.
-- **Config E:** Converges from adversarial initialization (opposite direction), achieving best mean error
-
-### 4.3 Moderate-Density Scenario
-
-12 vehicles, 83m spacing:
-
-| Config | Mean Error | a | b |
-|--------|-----------|------|------|
-| Plain adjoint | 33.7% | 64.3% | 36.4% |
-| + Saltation | 30.7% | 64.3% | 24.4% |
-
-Saltation improves `b` recovery (36.4% → 24.4%). Parameter `a` hits lower bound in all configs.
+| Parameter | Controls | Affects |
+|---|---|---|
+| $\tau$ | Decision sharpness in softmax | Gradient signal strength |
+| $\kappa$ | Lateral responsiveness | How quickly vehicle starts moving |
+| $u_{\max}$ | Maximum lateral speed | Lane-change duration |
 
 ---
 
-## 5. Structural Findings
+## 6. Continuous Politeness
 
-### 5.1 T Non-Identifiability
-The desired time headway T remains at ~30% error across **all** methods and scenarios. This is structural: T and b are coupled through the desired gap:
+### The Problem with Discrete Politeness
 
-$$s^* = vT + \frac{v\Delta v}{2\sqrt{ab}}$$
+Standard MOBIL computes politeness as the acceleration change for discrete "new follower" and "old follower" before/after the lane change. With continuous lateral dynamics, there is no discrete switch — vehicle $i$ gradually slides between lanes, continuously affecting all nearby vehicles.
 
-T and b create a correlated valley in the loss landscape — the optimizer converges to ~34% T error from both directions.
+### Continuous Formulation
 
-### 5.2 CF–LC Decoupling
-IDM and MOBIL operate as parallel systems with mutual suppression:
-- **Free flow:** MOBIL is active, IDM is passive → IDM parameters are invisible to lane-change decisions
-- **Congestion:** IDM dominates, MOBIL is suppressed → lane changes add no information
+$$\text{politeness}_i^{(k)} = p \cdot \frac{\partial}{\partial w_i^{(k)}} \sum_{j \neq i} a_j$$
 
-This is a **model-intrinsic limitation**, not a gradient quality issue. No amount of gradient engineering can overcome structural decoupling.
+This is the **marginal impact** of vehicle $i$'s lane-$k$ presence on all other vehicles' accelerations.
 
-### 5.3 Implication
-MOBIL was designed for forward simulation (2007), never for inversion. The structural decoupling suggests that a unified model — where car-following and lane-changing share a single objective function — would be fundamentally better suited for inverse problems. See the leader-selection model concept in [ideas](../idea/).
+**Interpretation:**
+- **Entering lane $k$:** followers in lane $k$ see a closer leader → their headway shrinks → acceleration drops. The derivative captures this.
+- **Leaving current lane:** followers behind lose a leader → headway increases → acceleration improves.
+- **Distance weighting:** The gradient decays exponentially with distance — no need to explicitly identify "new follower" or "old follower."
+
+### Relationship to Discrete MOBIL
+
+In the limit where lane weights are binary and only the nearest follower has non-negligible gradient, the continuous politeness reduces to the standard MOBIL term $p \cdot [(\tilde{a}_n - a_n) + (\tilde{a}_o - a_o)]$. The continuous version is strictly more general.
+
+### Implementation
+
+```python
+def total_others_acc(w_all, x, v, theta, mu, i):
+    accs = blended_acc_all(x, v, w_all, theta, mu)
+    return jnp.sum(accs) - accs[i]
+
+grad_w = jax.grad(total_others_acc)(w_all, x, v, theta, mu, i)
+politeness_ik = p * grad_w[i, k]
+```
+
+One backward pass per vehicle gives politeness for all $K$ lanes simultaneously.
 
 ---
 
-## 6. Implementation
+## 7. Lateral Dynamics
+
+$$\dot{y}_i = u_{\max} \cdot \tanh\left(\frac{\kappa(y_i^{\text{target}} - y_i)}{u_{\max}}\right)$$
+
+where:
+- $y_i^{\text{target}}$: softmax-weighted lane center (from §5)
+- $\kappa > 0$: proportional gain
+- $u_{\max} \approx 1.2$ m/s: maximum lateral velocity (typical for 3–5s lane changes)
+
+**Why tanh, not clip:** `clip` has zero gradient at saturation. In test scenarios, 61% of vehicle-timesteps hit saturation — that's 61% dead lateral gradients. $\tanh$ gives the same asymptotic behavior ($\dot{y} \to \pm u_{\max}$) but the gradient $\text{sech}^2(\cdot)$ is always nonzero.
+
+### Physical Constraints
+
+- Road boundaries: $y_i \in [0, (K-1) \cdot W]$
+- Non-negative velocity: $v_i \geq 0$
+
+---
+
+## 8. Full System ODE
+
+$$\dot{x}_i = v_i$$
+
+$$\dot{v}_i = a_i(x, v, y;\, \theta) \quad \text{(IDM with blended headway, §4)}$$
+
+$$\dot{y}_i = u_{\max} \cdot \tanh\left(\frac{\kappa(y_i^{\text{target}}(x, v, y;\, \theta) - y_i)}{u_{\max}}\right)$$
+
+for $i = 1, \ldots, N$.
+
+**Integration:** Euler or RK4. $\Delta t = 0.1$s.
+
+**No discrete events.** Lane changes happen when $\dot{y}_i \neq 0$, which is whenever the MOBIL softmax prefers a different lane. The vehicle physically moves, lane weights shift, and interactions evolve smoothly.
+
+---
+
+## 9. Differentiability
+
+### Every Component Is Smooth
+
+| Component | Smoothness |
+|---|---|
+| Lane weights $w_i^{(k)}(y_i)$ | Softmax of Gaussian — $C^\infty$ |
+| Soft-min headway $\bar{s}_i^{(k)}$ | Log-sum-exp — $C^\infty$ |
+| IDM acceleration | $C^\infty$ (softplus for $s^*$) |
+| MOBIL softmax | $C^\infty$ |
+| Continuous politeness | Gradient of smooth functions — $C^\infty$ |
+| Lateral velocity (tanh) | $C^\infty$ |
+
+### Gradient Method
+
+Standard reverse-mode AD (JAX `jax.grad`) through unrolled simulation. No custom adjoint needed — JAX handles the chain rule through Euler steps automatically.
+
+For long simulations, the continuous adjoint method reduces memory. But for the current scale (50–100 steps), unrolled autodiff is sufficient.
+
+---
+
+## 10. Hyperparameters
+
+| Symbol | Name | Role | Range | Notes |
+|---|---|---|---|---|
+| $\gamma$ | Lane weight sharpness | Lane boundary crispness | 1.0–5.0 m⁻² | Higher = sharper |
+| $\mu$ | Soft-min sharpness | Leader selection range | 0.05–0.5 m⁻¹ | $1/\mu$ = effective range |
+| $\tau$ | MOBIL softmax temperature | Decision gradient signal | 0.1–1.0 m/s² | Annealable |
+| $\kappa$ | Lateral proportional gain | LC responsiveness | 0.5–3.0 s⁻¹ | Avoid extreme saturation |
+| $u_{\max}$ | Max lateral velocity | LC duration | 0.8–1.5 m/s | ~3–5s for full LC |
+| $p$ | Politeness factor | Cooperation level | 0.0–0.5 | Standard MOBIL range |
+| $\Delta a_{\text{th}}$ | LC threshold | Incentive required | 0.1–0.5 m/s² | Standard MOBIL range |
+
+---
+
+## 11. Open Challenges
+
+### 11.1 Mid-Lane Equilibrium
+
+Gaussian lane weights create blended headways at mid-lane that can be better than either pure lane. The committed perception fix (§4) addresses this but introduces a near-hard decision boundary via $\tau_{\text{decide}}$.
+
+### 11.2 LC Oscillation
+
+Without cooldown, vehicles can rapidly switch preferred lanes (softmax oscillates between left/stay/right). Treiber's original MOBIL uses a cooldown timer — the continuous analog is under exploration (damping, hysteresis, frustration gating).
+
+### 11.3 Gradient Explosion at Long Horizons
+
+Autodiff through 1200+ chaotic timesteps causes Jacobian chain explosion. Gradient checkpointing or truncated BPTT needed for long simulations. Current validated range: ~100 steps.
+
+### 11.4 Half-Vehicle Bias
+
+A vehicle mid-transition ($w^{(1)} = w^{(2)} = 0.5$) contributes half its presence to each lane. Vehicles behind see a "half-vehicle" with inflated headways. This is a modeling bias — the committed perception fix mitigates for the ego vehicle but not for observers.
+
+---
+
+## 12. Implementation
 
 - **JAX** — automatic differentiation + GPU acceleration
 - **Python 3.12** — simulation loop
 - **Hardware:** NVIDIA A100 (Azure), RTX 4090 (local)
 
 ### Performance
-- CPU (dt=0.1, T=60s, 120 iter): ~125 min → 11.1% error
-- GPU (dt=0.2, T=30s, 60 iter): ~49 min → 18.3% error
-- Bottleneck: Python-level VJP loop (~50s/iter). `jax.lax.scan` refactor planned.
+
+- CPU (N=8, T=1200 steps): forward 9ms, backward 61ms, one optimization step 62ms
+- GPU not needed for N=8 paper. CPU is sufficient.
 
 ---
 
-## 7. Open Questions
+## 13. Comparison with Prior Approaches
 
-1. Does saltation matter in congested flows with 10+ LC events per observation?
-2. Can heterogeneous MOBIL (per-vehicle p, Δa_th) be reconstructed?
-3. Does the 3-lane Gumbel-Softmax genuinely outperform sigmoid for multi-lane?
-4. Can a two-stage approach (IDM first, then MOBIL) improve joint estimation?
+| Feature | DiffIDM (Son+) | Sigmoid MOBIL (Phase 2) | **This work (Phase 3)** |
+|---|---|---|---|
+| Lane changes | None | 2-lane, discrete + sigmoid | **N-lane, continuous lateral** |
+| Differentiability | Adjoint through IDM | Sigmoid relaxation of MOBIL | **Smooth ODE, no relaxation needed** |
+| LC duration | N/A | Instantaneous | **Physical (3–5s)** |
+| Multi-lane interaction | N/A | Binary (current/target) | **Continuous (position-based)** |
+| Politeness | N/A | Discrete (new/old follower) | **Continuous (marginal impact)** |
+| Gradient quality | Exact (no LC) | Approximate (sigmoid) | **Exact (smooth ODE, 10⁻⁹)** |
+| Special machinery | None | Saltation + sigmoid + event detection | **None — standard autodiff** |

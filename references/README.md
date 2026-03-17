@@ -37,15 +37,24 @@ Key papers for the Differentiable Lane-Change (diffLC) project.
 | A Review of Differentiable Simulators | Newbury et al. | 2024 | Survey of differentiable simulation | — |
 | Differentiable Hybrid Traffic Simulation | Son et al. | 2022 | Hybrid micro-macro differentiable traffic sim | — |
 
-## Lane-Change Game Theory
+## Contact Mechanics & IPC
+
+| Paper | Authors | Year | Topic | Link |
+|-------|---------|------|-------|------|
+| Incremental Potential Contact (IPC) | Li, Ferguson, Schneider, Langlois, et al. | 2020 | Smoothly-clamped log barrier for contact, C² smooth | [ACM TOG](https://doi.org/10.1145/3386569.3392425) |
+| Interior-Point Contact Smoothing | Dietz et al. | 2026 | Interior-point methods for differentiable contact | — |
+| Contact Gradient Properties | Ye et al. | 2025 | Gradient properties of contact models | — |
+
+## Lane-Change Game Theory & Potential Fields
 
 | Paper | Authors | Year | Topic | Link |
 |-------|---------|------|-------|------|
 | A Stackelberg Game Theoretic Model of Lane-Changing | Yoo, Langari | 2020 | Stackelberg games for lane-change | [DOI](https://doi.org/10.1109/TITS.2020.2975008) |
 | MPCC Formulation for Lane-Change Interaction | Burger, Zanon, Diehl | 2022 | Bilevel → MPCC, complementarity in LC | [ITSC 2022](https://doi.org/10.1109/ITSC55140.2022.9921807) |
-| Unified Risk Field for Lane-Change | Tan et al. | 2024 | Unified potential field for CF+LC | — |
+| Risk Potential Fields for Mandatory Lane Changes (TGPF) | Wang et al. | 2024 | Self-consuming attraction toward target lane | [DOI](https://doi.org/10.1016/j.eswa.2024.125230) |
 | Potential Field Lane-Change Model | Li et al. | 2022 | Physics-inspired LC model (155 citations) | — |
 | Stackelberg Inverse MPC | Zhang et al. | 2024 | Stackelberg + inverse optimal control | — |
+| Social Force Model for Roundabouts | Abo-Bakr et al. | 2025 | SFM with 5 forces, relaxation time | [DOI](https://doi.org/10.1007/s13177-025-00556-y) |
 
 ## Traffic Estimation & Inverse Problems
 
@@ -53,3 +62,4 @@ Key papers for the Differentiable Lane-Change (diffLC) project.
 |-------|---------|------|-------|------|
 | Localized Inverse Design in Conservation Laws | Colombo, Perrollaz | 2024 | Inverse problems for traffic PDEs | — |
 | Imagining The Road Ahead | Ścibior et al. | 2021 | Differentiable multi-agent trajectory prediction | [arXiv](https://arxiv.org/abs/2005.02550) |
+| Amortized Bayesian CF Calibration | Kong et al. | 2026 | Direct competitor — Bayesian car-following calibration | — |
